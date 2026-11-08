@@ -1,6 +1,7 @@
 import streamlit as st
 from google import genai
 from google.genai import types
+from google.genai.errors import ClientError, APIError
 
 st.set_page_config(page_title="Mark Peabody: Year Two", page_icon="🪄", layout="centered")
 
@@ -13,9 +14,9 @@ if not api_key:
     st.error("Missing GEMINI_API_KEY. Please configure it in your Streamlit secrets settings.")
     st.stop()
 
+# Initialize Client
 client = genai.Client(api_key=api_key)
 
-# Permanent System Instruction baked into every call
 SYSTEM_INSTRUCTION = """
 You are the Co-Director and Narrator for an interactive fiction retelling of Harry Potter: Year Two (Chamber of Secrets), centered on Mark Peabody (Hufflepuff).
 
@@ -47,8 +48,8 @@ if user_prompt:
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
-    # 2. Reconstruct context from the last 8 turns (prevents memory bloat while preserving recency)
-    recent_history = [
+    # 2. Reconstruct context from the last 8 turns
+    contents = [
         types.Content(
             role="user" if m["role"] == "user" else "model",
             parts=[types.Part.from_text(text=m["content"])]
@@ -56,16 +57,33 @@ if user_prompt:
         for m in st.session_state.messages[-8:]
     ]
 
-    # 3. Call Gemini
+    # 3. Call Gemini 3.8 Flash
     with st.chat_message("assistant"):
         with st.spinner("The castle stirs..."):
-            response = client.models.generate_content(
-                model="gemini-2.5-pro",
-                contents=recent_history,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    temperature=0.8,
-                )
-            )
-            st.markdown(response.text)
-            st.session_state.messages.append({"role": "assistant", "content": response.text})
+            story_text = None
+            last_err = None
+            
+            # Primary: 3.8 Flash; Fallback: 3.5 Flash-Lite or 3.1 Pro
+            candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro"]
+            
+            for model_id in candidate_models:
+                try:
+                    response = client.models.generate_content(
+                        model=model_id,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_INSTRUCTION,
+                            temperature=0.8,
+                        )
+                    )
+                    story_text = response.text
+                    break
+                except (ClientError, APIError) as e:
+                    last_err = e
+                    continue
+
+            if story_text:
+                st.markdown(story_text)
+                st.session_state.messages.append({"role": "assistant", "content": story_text})
+            else:
+                st.error(f"API Error details: {last_err}")
