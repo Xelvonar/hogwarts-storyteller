@@ -15,18 +15,16 @@ st.set_page_config(page_title="Hogwarts Storyteller: Mark Peabody", page_icon="�
 SHEET_ID = "1qk9mmxj5pFzY39eyyOS6mkYItgldn8rhpeP0zB8uzec"
 DOC_ID = "1gjNoEoIxCcDcpWnRAGC44gobRoMji8UNxCFz3xT3rx4"
 
-PRIMARY_MODEL = "gemini-4-hydrogen"
+PRIMARY_MODEL = "gemini-3.8-flash"
 FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-pro"]
 
 # ==============================================================================
-# 2. AUTHENTICATION & GOOGLE WORKSPACE CONNECTIONS
+# 2. AUTHENTICATION & GOOGLE WORKSPACE CONNECTIONS (CACHED)
 # ==============================================================================
 @st.cache_resource
 def init_clients():
-    # Gemini Client
     gemini_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     
-    # Google Sheets & Docs Service Account
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/documents"
@@ -36,19 +34,17 @@ def init_clients():
         scopes=scopes
     )
     gc = gspread.authorize(creds)
+    spreadsheet = gc.open_by_key(SHEET_ID)
     docs_service = build("docs", "v1", credentials=creds)
-    return gemini_client, gc, docs_service
+    return gemini_client, spreadsheet, docs_service
 
-gemini_client, gc, docs_service = init_clients()
+gemini_client, sh, docs_service = init_clients()
 
 # ==============================================================================
 # 3. DATABASE LOADING & CACHING
 # ==============================================================================
 def load_world_database():
     """Fetches all 8 tabs from Mark Peabody Information Tracker into RAM."""
-    sh = gc.open_by_key(SHEET_ID)
-    
-    # Session State has no header row (2-column Key-Value layout: Col A = Key, Col B = Value)
     ss_rows = sh.worksheet("Session State").get_all_values()
     session_meta = {}
     for row in ss_rows:
@@ -128,16 +124,16 @@ DIFF_SCHEMA = {
         "transient_facts": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "1-3 short, concrete micro-facts from this turn relevant to the immediate scene (e.g., 'Mark's right thumb is stiff', 'Owl post arrived from Hannah')."
+            "description": "1-3 short, concrete micro-facts from this turn relevant to the immediate scene."
         },
         "key_memory": {
             "type": "object",
             "description": "Populate ONLY if salience >= 3. Otherwise leave fields empty.",
             "properties": {
                 "should_record": {"type": "boolean"},
-                "characters": {"type": "string", "description": "Comma-separated names involved"},
-                "interaction_summary": {"type": "string", "description": "1 concise sentence summarizing the interaction context"},
-                "memory": {"type": "string", "description": "1-2 concise sentences capturing the lasting emotional or factual anchor"}
+                "characters": {"type": "string"},
+                "interaction_summary": {"type": "string"},
+                "memory": {"type": "string"}
             },
             "required": ["should_record", "characters", "interaction_summary", "memory"]
         },
@@ -148,11 +144,10 @@ DIFF_SCHEMA = {
                 "properties": {
                     "character": {"type": "string"},
                     "fact_secret": {"type": "string"},
-                    "new_knowledge_state": {"type": "string", "description": "1 concise sentence updating what they now know or suspect."}
+                    "new_knowledge_state": {"type": "string"}
                 },
                 "required": ["character", "fact_secret", "new_knowledge_state"]
-            },
-            "description": "ONLY include if a character directly witnessed, heard, or deduced a specific Fact/Secret in this turn. Never update PUBLIC rows."
+            }
         },
         "attitude_deltas": {
             "type": "array",
@@ -162,11 +157,10 @@ DIFF_SCHEMA = {
                     "character": {"type": "string"},
                     "value_toward": {"type": "string"},
                     "domain": {"type": "string", "enum": ["Warmth", "Dominance", "Candor", "Harmony", "Reliability", "Discretion"]},
-                    "delta": {"type": "number", "description": "Small shift between -0.15 and +0.15"}
+                    "delta": {"type": "number"}
                 },
                 "required": ["character", "value_toward", "domain", "delta"]
-            },
-            "description": "ONLY include if a notable interpersonal shift occurred between characters in the Attitude Tracker."
+            }
         },
         "character_location_updates": {
             "type": "array",
@@ -178,8 +172,7 @@ DIFF_SCHEMA = {
                     "new_activity": {"type": "string"}
                 },
                 "required": ["character_name", "new_location", "new_activity"]
-            },
-            "description": "ONLY if a character's physical location or active task visibly changed."
+            }
         }
     },
     "required": ["salience", "new_date", "new_location", "transient_facts", "key_memory", "knowledge_updates", "attitude_deltas", "character_location_updates"]
@@ -235,7 +228,6 @@ def append_to_narrative_doc(user_prompt: str, story_prose: str):
 def commit_state_updates(diff: dict):
     """Deterministically updates Session State, Key Memories, Attitudes, Knowledge, and Characters."""
     db = st.session_state.world_db
-    sh = gc.open_by_key(SHEET_ID)
     audit_notes = []
 
     # 1. Update Session State (Date, Location, Scene Turn)
@@ -253,7 +245,7 @@ def commit_state_updates(diff: dict):
 
     ss_ws = sh.worksheet("Session State")
     ss_rows = [[k, v] for k, v in meta.items()]
-    ss_ws.update("A1", ss_rows)
+    ss_ws.update(values=ss_rows, range_name="A1")
     audit_notes.append(f"Session State → {current_date} | {current_loc} | Turn {next_turn}")
 
     # 2. Salience 1-2: Store transient micro-facts in RAM only
@@ -269,7 +261,6 @@ def commit_state_updates(diff: dict):
     km = diff.get("key_memory", {})
     if salience >= 3 and km.get("should_record") and km.get("memory"):
         km_ws = sh.worksheet("Key Memories")
-        # Columns: Date, Characters, Salience, Interaction Summary, Memory
         new_row = [
             current_date,
             km.get("characters", "Mark Peabody"),
@@ -288,11 +279,10 @@ def commit_state_updates(diff: dict):
         audit_notes.append(f"Added Key Memory (Salience {salience})")
 
     # 4. Elastic Decay + Attitude Deltas on Attitude Tracker
-    # Columns: Character, Value Toward, Domain, Long Term Value, Current Value
     deltas = diff.get("attitude_deltas", [])
     delta_lookup = {(d["character"], d["value_toward"], d["domain"]): d["delta"] for d in deltas}
     att_changed = False
-    decay_rate = 0.15  # Pulls temporary Current Value 15% back toward Long Term Value each turn
+    decay_rate = 0.15
 
     for row in db["attitudes"]:
         try:
@@ -304,11 +294,9 @@ def commit_state_updates(diff: dict):
         key = (row["Character"], row["Value Toward"], row["Domain"])
         shift = delta_lookup.get(key, 0.0)
 
-        # Apply elastic spring toward Long Term Value + any new scene delta
         updated_val = cur_val + decay_rate * (lt_val - cur_val) + shift
         updated_val = round(max(0.0, min(1.0, updated_val)), 2)
 
-        # If Salience 5 keystone event, deform Long Term Value slightly as well
         if salience == 5 and shift != 0.0:
             lt_val = round(max(0.0, min(1.0, lt_val + (shift * 0.5))), 2)
             row["Long Term Value"] = lt_val
@@ -323,10 +311,9 @@ def commit_state_updates(diff: dict):
         att_ws = sh.worksheet("Attitude Tracker")
         headers = ["Character", "Value Toward", "Domain", "Long Term Value", "Current Value"]
         matrix = [headers] + [[r[h] for h in headers] for r in db["attitudes"]]
-        att_ws.update("A1", matrix)
+        att_ws.update(values=matrix, range_name="A1")
 
     # 5. Knowledge Updates
-    # Columns: Character, Fact/Secret, Knowledge State, Last Updated
     k_updates = diff.get("knowledge_updates", [])
     if k_updates:
         k_ws = sh.worksheet("Knowledge")
@@ -352,7 +339,7 @@ def commit_state_updates(diff: dict):
 
         k_headers = ["Character", "Fact/Secret", "Knowledge State", "Last Updated"]
         k_matrix = [k_headers] + [[r[h] for h in k_headers] for r in db["knowledge"]]
-        k_ws.update("A1", k_matrix)
+        k_ws.update(values=k_matrix, range_name="A1")
 
     # 6. Character Location / Activity Updates
     loc_updates = diff.get("character_location_updates", [])
@@ -368,7 +355,7 @@ def commit_state_updates(diff: dict):
                     audit_notes.append(f"Moved {lu['character_name']} → {lu['new_location']}")
         c_headers = list(db["characters"][0].keys())
         c_matrix = [c_headers] + [[r[h] for h in c_headers] for r in db["characters"]]
-        c_ws.update("A1", c_matrix)
+        c_ws.update(values=c_matrix, range_name="A1")
 
     return " | ".join(audit_notes)
 
@@ -389,8 +376,7 @@ with st.sidebar:
         st.session_state.scene_turns = []
         st.session_state.transient_facts = []
         meta["Scene Turn"] = "1"
-        sh = gc.open_by_key(SHEET_ID)
-        sh.worksheet("Session State").update("A1", [[k, v] for k, v in meta.items()])
+        sh.worksheet("Session State").update(values=[[k, v] for k, v in meta.items()], range_name="A1")
         st.success("Scene buffer cleared & Scene Turn reset to 1.")
         st.rerun()
 
@@ -408,7 +394,6 @@ with st.sidebar:
 st.title("🪄 Mark Peabody: Year Two")
 st.caption(f"{meta.get('Date', '')} — {meta.get('Location', '')}")
 
-# Render active scene messages
 for msg in st.session_state.scene_turns:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
@@ -421,12 +406,10 @@ if st.session_state.last_audit_log:
 # 7. MAIN TWO-PASS TURN LOOP
 # ==============================================================================
 if user_input := st.chat_input("What does Mark do or say?"):
-    # Display user prompt immediately
     st.session_state.scene_turns.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Assemble full snapshot payload (zero NLP parsing)
     world_snapshot = {
         "session_state": db["session_meta"],
         "characters": db["characters"],
@@ -471,7 +454,8 @@ Write the next narrative response from Mark Peabody's third-person limited persp
 
     # --- PASS 2: THE DIFF AUDITOR (temp = 0.1, Structured JSON) ---
     with st.spinner("Updating world state & memories..."):
-        diff_system = """
+        try:
+            diff_system = """
 You are a cold, conservative database auditor for an interactive story. Do NOT write fiction.
 Compare the newly generated scene against the pre-turn world database and output ONLY verified changes in strict JSON.
 - Salience 1: Fleeting micro-detail (passes in a few turns).
@@ -482,7 +466,7 @@ Compare the newly generated scene against the pre-turn world database and output
 - Only record a `key_memory` if salience >= 3.
 - Only add `knowledge_updates` if a character directly learned or deduced a specific Fact/Secret in this turn. Never modify PUBLIC rows.
 """
-        diff_prompt = f"""
+            diff_prompt = f"""
 PRE-TURN WORLD SNAPSHOT:
 {json.dumps(world_snapshot, indent=2)}
 
@@ -492,14 +476,16 @@ PLAYER ACTION:
 NEWLY GENERATED SCENE PROSE:
 {story_prose}
 """
-        raw_diff = call_gemini_with_fallback(
-            prompt_contents=diff_prompt,
-            system_instruction=diff_system,
-            temperature=0.1,
-            json_schema=DIFF_SCHEMA
-        )
-        parsed_diff = json.loads(raw_diff)
-        audit_summary = commit_state_updates(parsed_diff)
-        st.session_state.last_audit_log = audit_summary
+            raw_diff = call_gemini_with_fallback(
+                prompt_contents=diff_prompt,
+                system_instruction=diff_system,
+                temperature=0.1,
+                json_schema=DIFF_SCHEMA
+            )
+            parsed_diff = json.loads(raw_diff)
+            audit_summary = commit_state_updates(parsed_diff)
+            st.session_state.last_audit_log = audit_summary
+        except Exception as e:
+            st.session_state.last_audit_log = f"⚠️ Sheet sync skipped due to error: {repr(e)}"
 
     st.rerun()
